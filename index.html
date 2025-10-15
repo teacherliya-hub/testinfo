@@ -1,0 +1,533 @@
+<!DOCTYPE html>
+<html lang="zh-TW" class="dark">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>段考時程與監考儀表板 (離線版)</title>
+    <!-- 載入 Tailwind CSS -->
+    <script src="https://cdn.tailwindcss.com"></script>
+    <!-- 載入 Icon -->
+    <link href="https://cdnjs.cloudflare.com/ajax/libs/font-awesome/6.0.0-beta3/css/all.min.css" rel="stylesheet">
+    <style>
+        /* 修正: 主體背景直接使用深藍色 (slate-950: #0f172a) */
+        body {
+            font-family: 'Inter', sans-serif;
+            background-color: #0f172a; 
+            transition: background-color 0.3s;
+        }
+        /* 美化滾動條 */
+        .scroll-container::-webkit-scrollbar { width: 8px; }
+        .scroll-container::-webkit-scrollbar-thumb { background-color: #4b5563; border-radius: 4px; }
+        .scroll-container { max-height: 500px; overflow-y: auto; }
+        
+        /* === 圖示顏色強制修正 START === */
+        /* 這是強制將日曆和時鐘圖示變成白色，解決深色模式下的圖示顏色繼承問題 */
+        input[type="date"]::-webkit-calendar-picker-indicator,
+        input[type="time"]::-webkit-calendar-picker-indicator {
+            filter: invert(1); 
+            color: #ffffff; 
+            cursor: pointer;
+            opacity: 1;
+        }
+        /* === 圖示顏色強制修正 END === */
+    </style>
+    <script>
+        // === Local Storage 離線版腳本 (無需 Firebase) ===
+
+        // 全域變數初始化
+        window.currentSelectedExam = null;
+        window.isEditingId = null; 
+
+        // --- 1. 應用程式啟動入口 ---
+        document.addEventListener('DOMContentLoaded', () => {
+            startApplication();
+        });
+
+        const startApplication = () => {
+            setupTitleEditor(); 
+            setInterval(updateCurrentTime, 1000); 
+            updateCurrentTime();
+            
+            // 從 LocalStorage 載入資料
+            renderSchedule();
+            loadProctorData();
+
+            // 綁定事件監聽
+            document.getElementById('add-exam-btn').addEventListener('click', handleAddOrUpdateExam);
+            // 監考紀錄輸入時自動儲存並計算缺考人數
+            document.getElementById('proctor-form').addEventListener('input', debounce(saveProctorData, 1000));
+            
+            // 啟動倒數計時器
+            setInterval(updateCountdown, 1000);
+            updateCountdown();
+        };
+        
+        // --- 2. 公共工具函數 ---
+        const debounce = (func, delay) => {
+            let timeout;
+            return (...args) => {
+                clearTimeout(timeout);
+                timeout = setTimeout(() => func.apply(this, args), delay);
+            };
+        }
+
+        const formatDateTime = (date) => {
+            const y = date.getFullYear();
+            const m = String(date.getMonth() + 1).padStart(2, '0');
+            const d = String(date.getDate()).padStart(2, '0');
+            const hh = String(date.getHours()).padStart(2, '0');
+            const mm = String(date.getMinutes()).padStart(2, '0');
+            return `${y}-${m}-${d} ${hh}:${mm}`;
+        }
+
+        // --- 3. 頂部標題編輯功能 ---
+        const setupTitleEditor = () => {
+            const titleElement = document.getElementById('main-title');
+            // 修正: 預設標題為「前鎮國中段考時程表」
+            const savedTitle = localStorage.getItem('appTitle') || '前鎮國中段考時程表';
+            titleElement.textContent = savedTitle;
+
+            titleElement.addEventListener('dblclick', () => {
+                const currentText = titleElement.textContent;
+                const input = document.createElement('input');
+                input.type = 'text';
+                input.value = currentText;
+                input.className = 'w-full text-4xl sm:text-5xl font-extrabold text-yellow-300 bg-gray-700 border-b-2 border-blue-500 focus:outline-none text-center';
+                
+                titleElement.innerHTML = '';
+                titleElement.appendChild(input);
+                input.focus();
+
+                const saveTitle = () => {
+                    const newText = input.value.trim() || '前鎮國中段考時程表';
+                    titleElement.textContent = newText;
+                    localStorage.setItem('appTitle', newText);
+                };
+
+                input.addEventListener('blur', saveTitle);
+                input.addEventListener('keydown', (e) => e.key === 'Enter' && saveTitle());
+            });
+        };
+
+        // --- 4. 左欄：考試時程 CRUD (LocalStorage 版本) ---
+
+        // 從 LocalStorage 讀取時程資料
+        const getSchedules = () => {
+            try {
+                const data = localStorage.getItem('exam_schedules');
+                return data ? JSON.parse(data) : [];
+            } catch (e) {
+                console.error("Error parsing schedules from LocalStorage", e);
+                return [];
+            }
+        };
+
+        // 將時程資料寫入 LocalStorage
+        const saveSchedules = (schedules) => {
+            // 排序後再儲存
+            schedules.sort((a, b) => a.end_timestamp - b.end_timestamp);
+            localStorage.setItem('exam_schedules', JSON.stringify(schedules));
+        };
+        
+        // 渲染整個時程列表
+        const renderSchedule = () => {
+            const schedules = getSchedules();
+            const scheduleList = document.getElementById('schedule-list');
+            scheduleList.innerHTML = '';
+
+            if (schedules.length === 0) {
+                 scheduleList.innerHTML = '<p class="text-center text-gray-400 p-4">尚未新增任何考試科目。</p>';
+                 return;
+            }
+
+            schedules.forEach(data => {
+                const examItem = createExamItemElement(data);
+                scheduleList.appendChild(examItem);
+
+                // 重新選中上次選擇的項目
+                if (window.currentSelectedExam && window.currentSelectedExam.id === data.id) {
+                     examItem.classList.add('border-blue-500', 'bg-blue-800');
+                }
+            });
+        };
+        
+        // 處理新增或更新
+        const handleAddOrUpdateExam = () => {
+            const subject = document.getElementById('new-subject').value.trim();
+            const date = document.getElementById('new-date').value;
+            const startTime = document.getElementById('new-start-time').value;
+            const endTime = document.getElementById('new-end-time').value;
+
+            if (!subject || !date || !startTime || !endTime) {
+                showModal("錯誤", "請填寫所有欄位！");
+                return;
+            }
+
+            const examStartTime = new Date(`${date}T${startTime}:00`);
+            const examEndTime = new Date(`${date}T${endTime}:00`);
+
+            if (isNaN(examStartTime) || isNaN(examEndTime) || examStartTime.getTime() >= examEndTime.getTime()) {
+                showModal("錯誤", "時間格式錯誤或開始時間晚於結束時間！");
+                return;
+            }
+
+            const schedules = getSchedules();
+            const payload = {
+                subject, date, start_time: startTime, end_time: endTime,
+                start_timestamp: examStartTime.getTime(),
+                end_timestamp: examEndTime.getTime(),
+            };
+
+            if (window.isEditingId) {
+                // 更新
+                const index = schedules.findIndex(s => s.id === window.isEditingId);
+                if (index !== -1) {
+                    schedules[index] = { ...schedules[index], ...payload };
+                    // 更新選中項目
+                    if(window.currentSelectedExam && window.currentSelectedExam.id === window.isEditingId) {
+                         window.currentSelectedExam = schedules[index];
+                    }
+                }
+            } else {
+                // 新增
+                payload.id = `exam_${Date.now()}_${Math.random().toString(36).substr(2, 9)}`; // 使用唯一ID
+                schedules.push(payload);
+            }
+            
+            saveSchedules(schedules);
+            renderSchedule();
+            cancelEdit();
+            document.getElementById('new-subject').value = ''; // 清空科目
+        };
+
+        // 創建列表項目 DOM
+        const createExamItemElement = (data) => {
+            const { id, subject, date, start_time, end_time } = data;
+            
+            const item = document.createElement('div');
+            // 修正: 列表項目背景與 Hover 顏色
+            item.className = 'bg-blue-900 p-4 rounded-lg shadow-md mb-2 flex justify-between items-center transition duration-200 ease-in-out cursor-pointer hover:bg-blue-800 border border-transparent';
+            
+            item.innerHTML = `
+                <div>
+                    <p class="font-bold text-gray-100">${subject}</p>
+                    <p class="text-sm text-gray-300">${date} | ${start_time} - ${end_time}</p>
+                </div>
+                <div class="flex space-x-2 items-center">
+                    <button class="edit-btn text-yellow-400 hover:text-yellow-300 p-2 rounded-full transition" title="編輯"><i class="fas fa-edit"></i></button>
+                    <button class="delete-btn text-red-400 hover:text-red-300 p-2 rounded-full transition" title="刪除"><i class="fas fa-trash"></i></button>
+                </div>
+            `;
+            
+            item.addEventListener('click', (e) => {
+                if (e.target.closest('.delete-btn') || e.target.closest('.edit-btn')) return;
+                document.querySelectorAll('#schedule-list > div').forEach(el => {
+                    el.classList.remove('border-blue-500', 'bg-blue-800');
+                    el.classList.add('bg-blue-900');
+                });
+                item.classList.remove('bg-blue-900');
+                item.classList.add('border-blue-500', 'bg-blue-800');
+                window.currentSelectedExam = data;
+                updateCountdown();
+            });
+            
+            item.querySelector('.edit-btn').addEventListener('click', () => handleEditExam(data));
+            item.querySelector('.delete-btn').addEventListener('click', () => handleDeleteExam(id, subject));
+
+            return item;
+        };
+        
+        const handleDeleteExam = (id, subject) => {
+            showModal("確認刪除", `您確定要刪除科目：${subject} 嗎？`, () => {
+                let schedules = getSchedules();
+                schedules = schedules.filter(s => s.id !== id);
+                saveSchedules(schedules);
+                renderSchedule();
+                if (window.currentSelectedExam && window.currentSelectedExam.id === id) {
+                    window.currentSelectedExam = null;
+                    updateCountdown();
+                }
+                if (window.isEditingId === id) cancelEdit();
+            }, true);
+        };
+        
+        const cancelEdit = () => {
+            document.getElementById('new-subject').value = '';
+            window.isEditingId = null;
+            const addButton = document.getElementById('add-exam-btn');
+            const cancelButton = document.getElementById('cancel-edit-btn');
+            
+            // 恢復新增按鈕樣式
+            addButton.innerHTML = '<i class="fas fa-plus mr-1"></i> 新增';
+            addButton.classList.remove('bg-orange-500', 'hover:bg-orange-600', 'w-2/3');
+            addButton.classList.add('bg-green-500', 'hover:bg-green-600', 'w-full');
+            
+            if (cancelButton) cancelButton.classList.add('hidden');
+        };
+
+        const handleEditExam = (data) => {
+            cancelEdit();
+            window.isEditingId = data.id;
+            document.getElementById('new-subject').value = data.subject;
+            document.getElementById('new-date').value = data.date;
+            document.getElementById('new-start-time').value = data.start_time;
+            document.getElementById('new-end-time').value = data.end_time;
+            
+            const addButton = document.getElementById('add-exam-btn');
+            const buttonContainer = document.getElementById('add-button-container');
+            
+            // 變更為儲存按鈕樣式
+            addButton.innerHTML = '<i class="fas fa-save mr-1"></i> 儲存變更';
+            addButton.classList.remove('bg-green-500', 'hover:bg-green-600', 'w-full');
+            addButton.classList.add('bg-orange-500', 'hover:bg-orange-600', 'w-2/3');
+            
+            let cancelButton = document.getElementById('cancel-edit-btn');
+            if (!cancelButton) {
+                cancelButton = document.createElement('button');
+                cancelButton.id = 'cancel-edit-btn';
+                cancelButton.className = 'w-1/3 bg-gray-600 text-white p-2 rounded-md hover:bg-gray-700 transition shadow-md ml-2';
+                cancelButton.innerHTML = '<i class="fas fa-times mr-1"></i> 取消';
+                cancelButton.addEventListener('click', cancelEdit);
+                buttonContainer.appendChild(cancelButton);
+            } else {
+                cancelButton.classList.remove('hidden');
+            }
+        };
+
+        // --- 5. 中間欄：時間與倒數計時 ---
+        const updateCurrentTime = () => {
+            // 修正: 現在時間文字顏色
+            document.getElementById('current-time').textContent = `現在時間：${formatDateTime(new Date())}`;
+        };
+
+        const updateCountdown = () => {
+            const countdownElement = document.getElementById('countdown-display');
+            const messageElement = document.getElementById('exam-message');
+            const countdownBox = document.getElementById('countdown-box');
+            
+            if (!window.currentSelectedExam) {
+                countdownElement.textContent = '---';
+                messageElement.innerHTML = '<p class="text-gray-300">請在左側選擇一個考試科目以顯示其狀態。</p>';
+                countdownBox.className = 'p-4 rounded-xl shadow-lg mt-4 bg-gray-700'; // 未選中時使用灰色
+                return;
+            }
+
+            const { subject, start_time, end_time, start_timestamp, end_timestamp } = window.currentSelectedExam;
+            const nowTimestamp = Date.now();
+            
+            let statusClass, countdownLabel, timeDifference;
+
+            if (nowTimestamp < start_timestamp) {
+                // 尚未開始
+                statusClass = 'text-green-400';
+                countdownLabel = '距離開始還有';
+                timeDifference = start_timestamp - nowTimestamp;
+            } else if (nowTimestamp >= start_timestamp && nowTimestamp < end_timestamp) {
+                // 進行中
+                statusClass = 'text-yellow-400';
+                countdownLabel = '距離結束還有';
+                timeDifference = end_timestamp - nowTimestamp;
+            } else {
+                // 已結束
+                statusClass = 'text-red-400';
+                countdownLabel = '考試已結束';
+                timeDifference = 0;
+            }
+
+            const totalSeconds = Math.max(0, Math.floor(timeDifference / 1000));
+            const hours = Math.floor(totalSeconds / 3600);
+            const minutes = Math.floor((totalSeconds % 3600) / 60);
+            const seconds = totalSeconds % 60;
+            const timeFormatted = `${String(hours).padStart(2, '0')} 小時 ${String(minutes).padStart(2, '0')} 分 ${String(seconds).padStart(2, '0')} 秒`;
+
+            countdownElement.textContent = timeFormatted;
+            messageElement.innerHTML = `
+                <p class="text-2xl font-bold ${statusClass} mb-2">${subject}</p>
+                <p class="text-lg text-gray-300">考試時段：${start_time} - ${end_time}</p>
+                <p class="mt-4 text-xl font-semibold text-red-400">${countdownLabel}:</p>
+            `;
+            
+            // 根據狀態調整倒數計時區塊顏色
+            if (totalSeconds > 0) {
+                 countdownBox.className = 'p-4 rounded-xl shadow-lg mt-4 bg-blue-600 hover:bg-blue-700 transition duration-300';
+            } else {
+                 countdownBox.className = 'p-4 rounded-xl shadow-lg mt-4 bg-gray-600';
+            }
+        };
+
+        // --- 6. 右欄：監考紀錄 (LocalStorage 版本) ---
+        const loadProctorData = () => {
+            try {
+                const data = localStorage.getItem('proctor_record');
+                if (data) {
+                    const parsedData = JSON.parse(data);
+                    document.getElementById('input-class').value = parsedData.class_name || '';
+                    document.getElementById('input-expected').value = parsedData.expected_count || '';
+                    document.getElementById('input-present').value = parsedData.present_count || '';
+                    document.getElementById('input-absent-seats').value = parsedData.absent_seats || '';
+                    calculateAbsent();
+                }
+            } catch (e) { console.error("Error loading proctor data", e); }
+        };
+
+        const saveProctorData = () => {
+            const data = {
+                class_name: document.getElementById('input-class').value.trim(),
+                expected_count: document.getElementById('input-expected').value,
+                present_count: document.getElementById('input-present').value,
+                absent_seats: document.getElementById('input-absent-seats').value.trim(),
+            };
+            localStorage.setItem('proctor_record', JSON.stringify(data));
+            calculateAbsent();
+            const saveStatus = document.getElementById('save-status');
+            saveStatus.textContent = `已於 ${new Date().toLocaleTimeString('zh-TW')} 儲存至本機瀏覽器`;
+            saveStatus.classList.remove('hidden');
+            setTimeout(() => saveStatus.classList.add('hidden'), 3000); // 3秒後隱藏
+        };
+        
+        const calculateAbsent = () => {
+            const expected = parseInt(document.getElementById('input-expected').value) || 0;
+            const present = parseInt(document.getElementById('input-present').value) || 0;
+            document.getElementById('input-absent').value = Math.max(0, expected - present);
+        };
+
+        // --- 7. 介面邏輯 (Modal) ---
+        const showModal = (title, message, confirmCallback = null, isConfirm = false) => {
+            const modal = document.getElementById('custom-modal');
+            document.getElementById('modal-title').textContent = title;
+            document.getElementById('modal-message').textContent = message;
+            
+            const confirmBtn = document.getElementById('modal-confirm-btn');
+            const cancelBtn = document.getElementById('modal-cancel-btn');
+
+            // 修正 Modal 內容背景
+            const modalContent = modal.querySelector('#modal-content');
+            modalContent.classList.add('bg-gray-800'); 
+
+            confirmBtn.onclick = () => {
+                if (isConfirm && confirmCallback) confirmCallback();
+                modal.classList.add('hidden');
+            };
+            
+            cancelBtn.classList.toggle('hidden', !isConfirm);
+            cancelBtn.onclick = () => modal.classList.add('hidden');
+            
+            modal.classList.remove('hidden');
+        };
+    </script>
+</head>
+<body>
+    <!-- 自定義 Modal -->
+    <div id="custom-modal" class="hidden fixed inset-0 z-50 flex items-center justify-center bg-black bg-opacity-50">
+        <div id="modal-content" class="bg-gray-800 rounded-lg p-6 w-11/12 max-w-sm shadow-2xl">
+            <h3 id="modal-title" class="text-xl font-bold text-gray-100 mb-4 border-b pb-2"></h3>
+            <p id="modal-message" class="text-gray-300 mb-6"></p>
+            <div class="flex justify-end space-x-3">
+                <button id="modal-cancel-btn" class="px-4 py-2 bg-gray-700 text-gray-200 rounded-md hover:bg-gray-600">取消</button>
+                <button id="modal-confirm-btn" class="px-4 py-2 bg-blue-500 text-white rounded-md hover:bg-blue-600">確認</button>
+            </div>
+        </div>
+    </div>
+
+    <!-- 主容器 -->
+    <div class="min-h-screen p-4 sm:p-8 text-gray-100">
+        <!-- 頂部標題 -->
+        <header class="text-center mb-8">
+            <!-- 修正: 標題顏色固定為淺黃色 (text-yellow-300) -->
+            <h1 id="main-title" class="text-4xl sm:text-5xl font-extrabold text-yellow-300 cursor-pointer p-2 inline-block hover:bg-gray-700 rounded-lg transition">前鎮國中段考時程表</h1>
+            <!-- 修正: 提示文字使用淺灰色 -->
+            <p class="text-sm text-gray-400 mt-1"><i class="fas fa-edit mr-1"></i> (雙擊上方標題可編輯)</p>
+        </header>
+
+        <!-- 三欄佈局: lg:grid-cols-7 實現 2:3:2 比例 -->
+        <div class="grid grid-cols-1 lg:grid-cols-7 gap-8 max-w-7xl mx-auto">
+            <!-- 1. 左側欄 (2/7 寬度) -->
+            <div class="lg:col-span-2 bg-blue-950 rounded-xl shadow-2xl p-6 border-t-4 border-blue-500">
+                <h2 class="text-2xl font-bold text-cyan-300 mb-4 flex items-center"><i class="fas fa-calendar-alt text-blue-500 mr-2"></i> 考試日程表</h2>
+                
+                <!-- 列表置於上方 -->
+                <div id="schedule-list" class="scroll-container mb-6"></div>
+
+                <!-- 手動新增/編輯區域置於下方 -->
+                <div class="p-4 bg-blue-900 rounded-lg border border-blue-800">
+                    <p class="font-semibold mb-2 text-gray-100">手動新增/編輯科目</p>
+                    <!-- 修正: 輸入框背景使用深藍色 950，文字為白色 -->
+                    <input type="text" id="new-subject" placeholder="科目名稱 (如：數學)" class="w-full mb-2 p-2 border border-blue-800 rounded-md bg-blue-950 text-gray-100">
+                    <input type="date" id="new-date" class="w-full mb-2 p-2 border border-blue-800 rounded-md bg-blue-950 text-gray-100">
+                    <div class="flex space-x-2 mb-4">
+                        <input type="time" id="new-start-time" class="w-1/2 p-2 border border-blue-800 rounded-md bg-blue-950 text-gray-100" title="開始時間">
+                        <input type="time" id="new-end-time" class="w-1/2 p-2 border border-blue-800 rounded-md bg-blue-950 text-gray-100" title="結束時間">
+                    </div>
+                    <div id="add-button-container" class="flex w-full">
+                        <button id="add-exam-btn" class="w-full bg-green-500 text-white p-2 rounded-md hover:bg-green-600 transition shadow-md"><i class="fas fa-plus mr-1"></i> 新增</button>
+                        <!-- 取消按鈕會由 JS 動態生成 -->
+                    </div>
+                </div>
+            </div>
+
+            <!-- 2. 中間欄 (3/7 寬度) -->
+            <div class="lg:col-span-3 bg-blue-950 rounded-xl shadow-2xl p-6 text-center border-t-4 border-red-500">
+                <h2 class="text-2xl font-bold text-red-300 mb-4 flex items-center justify-center"><i class="fas fa-clock text-red-500 mr-2"></i> 現在考試科目</h2>
+                
+                <!-- 現在時間顯示 -->
+                <div class="p-4 bg-blue-900 rounded-lg mb-6 border border-red-700">
+                    <!-- 修正: 現在時間文字顏色為淺紅色 -->
+                    <p id="current-time" class="text-2xl font-extrabold text-red-300"></p>
+                </div>
+                
+                <!-- 考試訊息與倒數 -->
+                <div class="p-6 bg-blue-900 rounded-lg border border-blue-700 min-h-[250px] flex flex-col justify-center">
+                    <h3 class="text-xl font-bold text-cyan-300 mb-4"><i class="fas fa-bell mr-1"></i> 考試訊息</h3>
+                    <div id="exam-message" class="mb-4"></div>
+                    <!-- 倒數計時區塊 -->
+                    <div id="countdown-box" class="p-4 rounded-xl shadow-lg mt-4 bg-blue-600">
+                        <p id="countdown-display" class="text-4xl font-extrabold mt-1 text-white">---</p>
+                    </div>
+                </div>
+            </div>
+
+            <!-- 3. 右側欄 (2/7 寬度) -->
+            <div class="lg:col-span-2 bg-blue-950 rounded-xl shadow-2xl p-6 border-t-4 border-purple-500">
+                <h2 class="text-2xl font-bold text-purple-300 mb-4 flex items-center"><i class="fas fa-clipboard-list text-purple-500 mr-2"></i> 監考紀錄 (本機儲存)</h2>
+                <form id="proctor-form" class="space-y-4">
+                    <!-- 修正: 標籤文字為白色 -->
+                    <div>
+                        <label for="input-class" class="block text-sm font-medium text-gray-100">班級</label>
+                        <input type="text" id="input-class" placeholder="如：二年忠班" class="mt-1 w-full p-2 border border-blue-800 rounded-md bg-blue-950 text-gray-100">
+                    </div>
+                    <div>
+                        <label for="input-expected" class="block text-sm font-medium text-gray-100">應到人數</label>
+                        <input type="number" id="input-expected" placeholder="例如：40" class="mt-1 w-full p-2 border border-blue-800 rounded-md bg-blue-950 text-gray-100">
+                    </div>
+                    <div>
+                        <label for="input-present" class="block text-sm font-medium text-gray-100">應考人數</label>
+                        <input type="number" id="input-present" placeholder="例如：38" class="mt-1 w-full p-2 border border-blue-800 rounded-md bg-blue-950 text-gray-100">
+                    </div>
+                    <div>
+                        <label for="input-absent" class="block text-sm font-medium text-gray-100">缺考人數 (自動計算)</label>
+                        <!-- 修正: 缺考人數輸入框樣式 -->
+                        <input type="number" id="input-absent" readonly class="mt-1 w-full p-2 border border-blue-800 bg-blue-900 text-gray-400 rounded-md cursor-not-allowed">
+                    </div>
+                    <div>
+                        <label for="input-absent-seats" class="block text-sm font-medium text-gray-100">缺席座號</label>
+                        <textarea id="input-absent-seats" rows="3" placeholder="請輸入座號，以逗號或空格分隔" class="mt-1 w-full p-2 border border-blue-800 rounded-md bg-blue-950 text-gray-100"></textarea>
+                    </div>
+                    <p id="save-status" class="text-sm text-green-400 mt-2 hidden"></p>
+                </form>
+            </div>
+        </div>
+
+        <!-- 底部提示 -->
+        <div class="text-center mt-12 space-y-2 pb-8">
+            <p class="text-sm text-amber-400 bg-amber-900/50 inline-block px-4 py-2 rounded-lg border border-amber-600">
+                <i class="fas fa-exclamation-triangle mr-2"></i>
+                <strong>重要：</strong>所有資料均儲存於您本機的瀏覽器中。清除瀏覽器快取將會導致資料永久遺失。
+            </p>
+            <!-- 新增製作者訊息 -->
+            <p class="text-sm text-gray-500">
+                製作者：前鎮國中資訊組
+            </p>
+        </div>
+    </div>
+</body>
+</html>
